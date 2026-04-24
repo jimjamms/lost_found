@@ -1,0 +1,18 @@
+sudo apt install ros-<distro>-azure-kinect-ros-driver
+roslaunch azure_kinect_ros_driver driver.launch
+rostopic list
+
+Start the Kinect: ros2 launch azure_kinect_ros_driver driver.launch.py
+
+Verify the Topics: ros2 topic list (Look for /rgb/image_raw)
+
+Run your Node: python3 your_script_name.py
+
+source /opt/ros/humble/setup.bash
+# And if your custom services are in a workspace:
+# source ~/your_workspace/install/setup.bash
+
+pip install ultralytics
+
+sudo apt update
+sudo apt install ros-humble-cv-bridge ros-humble-vision-msgs ros-humble-message-filters
