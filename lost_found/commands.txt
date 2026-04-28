@@ -14,5 +14,8 @@ source /opt/ros/humble/setup.bash
 
 pip install ultralytics
 
+# Optional voice query support. The code still works with typed input if these are not installed.
+pip install SpeechRecognition pyttsx3 pyaudio
+
 sudo apt update
 sudo apt install ros-humble-cv-bridge ros-humble-vision-msgs ros-humble-message-filters

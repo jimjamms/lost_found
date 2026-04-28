@@ -20,6 +20,7 @@ from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import PointStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from voice_query import VoiceIO, extract_item, format_answer, is_cancel_query, wants_guidance
 
 class KeyboardScout(Node):
     def __init__(self, user_radius):
@@ -33,6 +34,7 @@ class KeyboardScout(Node):
         self.bridge = CvBridge()
         self.target_list = ['backpack', 'cup', 'bottle', 'person']
         self.object_memory = {item: [] for item in self.target_list}
+        self.voice = VoiceIO(enabled=True)
         
         self.latest_depth_msg = None
         self.camera_intrinsics = None
@@ -72,7 +74,7 @@ class KeyboardScout(Node):
         self.create_timer(1.0, self.watchdog_logic) 
         threading.Thread(target=self.keyboard_logic_loop, daemon=True).start()
 
-        self.get_logger().info(f"SCOUT ONLINE: Facing logic enabled for radius {self.patrol_radius}m.")
+        self.get_logger().info(f"SCOUT ONLINE: Voice query enabled for radius {self.patrol_radius}m.")
 
     def scan_cb(self, msg):
         num_readings = len(msg.ranges)
@@ -247,12 +249,35 @@ class KeyboardScout(Node):
     def handle_menu(self):
         while True:
             seen = {k: len(v) for k, v in self.object_memory.items() if len(v) > 0}
-            print(f"\n--- SEARCH MENU ---")
-            if not seen: print("Memory empty."); return
-            for obj, count in seen.items(): print(f"- {obj}: {count} instance(s)")
-            choice = input("\nTarget name (or 'nevermind'): ").strip().lower()
-            if choice == 'nevermind': self.state = "WANDERING"; return
-            if choice in seen: self.target_label, self.target_index = choice, 0; self.start_guidance(); return
+            print("\n--- VOICE SEARCH ---")
+            if seen:
+                for obj, count in seen.items():
+                    print(f"- {obj}: {count} instance(s)")
+            else:
+                print("Memory empty.")
+
+            query = self.voice.listen("Ask: 'Have you seen a bottle?' (or 'nevermind'): ").strip()
+            if is_cancel_query(query):
+                self.state = "WANDERING"
+                return
+
+            item = extract_item(query, self.target_list)
+            locations = self.object_memory.get(item, []) if item else []
+            self.voice.speak(format_answer(item, locations))
+
+            if item not in seen:
+                continue
+
+            if wants_guidance(query):
+                self.target_label, self.target_index = item, 0
+                self.start_guidance()
+                return
+
+            guide_ans = self.voice.listen(f"Should I guide you to the {item}? (yes/no): ").strip().lower()
+            if guide_ans.startswith('y'):
+                self.target_label, self.target_index = item, 0
+                self.start_guidance()
+                return
 
     def start_guidance(self):
         locs = self.object_memory.get(self.target_label, [])
