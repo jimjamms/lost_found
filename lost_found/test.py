@@ -20,7 +20,6 @@ from tf2_ros import Buffer, TransformListener
 from tf2_geometry_msgs import PointStamped
 from nav2_msgs.action import NavigateToPose
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from voice_query import VoiceIO, extract_item, format_answer, is_cancel_query, wants_guidance
 
 class KeyboardScout(Node):
     def __init__(self, user_radius):
@@ -32,9 +31,8 @@ class KeyboardScout(Node):
         self.model = YOLO('yolov8n.pt')
         self.model.to('cpu')
         self.bridge = CvBridge()
-        self.target_list = ['backpack', 'cup', 'bottle', 'person']
+        self.target_list = ['backpack', 'cup', 'bottle', 'umbrella', 'handbag', 'laptop', 'cell phone']
         self.object_memory = {item: [] for item in self.target_list}
-        self.voice = VoiceIO(enabled=True)
         
         self.latest_depth_msg = None
         self.camera_intrinsics = None
@@ -48,11 +46,12 @@ class KeyboardScout(Node):
         self.home_pose = None
         self.is_navigating = False
         self.last_angle = 0.0 
+        self.current_wander_target = (0.0, 0.0)
         
-        # Stall tracking
         self.last_pos = None
         self.last_rot = None
         self.last_activity_time = time.time()
+        self.nav_start_time = time.time() 
         self.goal_handle = None 
 
         # 3. ROS Setup
@@ -70,86 +69,96 @@ class KeyboardScout(Node):
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
 
         # 4. Threads & Timers
-        self.create_timer(5.0, self.wander_logic)
-        self.create_timer(1.0, self.watchdog_logic) 
+        self.create_timer(1.0, self.wander_logic)
+        self.create_timer(0.2, self.watchdog_logic) # Increased frequency for safety
         threading.Thread(target=self.keyboard_logic_loop, daemon=True).start()
 
-        self.get_logger().info(f"SCOUT ONLINE: Voice query enabled for radius {self.patrol_radius}m.")
+        self.get_logger().info(f"SCOUT ONLINE: Wide-arc safety enabled (Radius: {self.patrol_radius}m).")
 
     def scan_cb(self, msg):
+        """Monitor a wide 180-degree arc to protect the robot's sides."""
         num_readings = len(msg.ranges)
-        center_idx, cone_width = num_readings // 2, num_readings // 4 
-        start_idx, end_idx = center_idx - (cone_width // 2), center_idx + (cone_width // 2)
-        front_ranges = [r for r in msg.ranges[start_idx:end_idx] if msg.range_min < r < msg.range_max]
-        self.front_obstacle_detected = True if (front_ranges and min(front_ranges) < 0.8) else False
+        # We check the middle 50% of the scan (assuming 360 scan, 180 deg in front)
+        # If your LiDAR is 180 deg, remove the slicing and check the whole array.
+        start_idx = num_readings // 4
+        end_idx = 3 * num_readings // 4
+        
+        relevant_ranges = msg.ranges[start_idx:end_idx]
+        valid_ranges = [r for r in relevant_ranges if msg.range_min < r < msg.range_max]
+        
+        # 0.65m buffer (adjust based on your robot's physical footprint)
+        self.front_obstacle_detected = True if (valid_ranges and min(valid_ranges) < 0.65) else False
 
     def watchdog_logic(self):
         if not self.is_navigating:
+            self.last_activity_time = time.time()
+            return
+
+        # --- IMMEDIATE SAFETY INTERVENTION ---
+        if self.front_obstacle_detected:
+            self.get_logger().error("SAFETY STOP: Side/Front obstacle detected!")
+            self.stop_navigation()
+            # Reset activity time to give it a fresh start after recovery
             self.last_activity_time = time.time()
             return
             
         try:
             t = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             curr_pos = (t.transform.translation.x, t.transform.translation.y)
-            curr_rot = (t.transform.rotation.z, t.transform.rotation.w)
+            curr_rot_z = t.transform.rotation.z
 
-            # Check if we are close enough to the item to stop and turn
+            if self.state == "WANDERING":
+                dist_to_goal = math.hypot(curr_pos[0] - self.current_wander_target[0], 
+                                          curr_pos[1] - self.current_wander_target[1])
+                if dist_to_goal < 0.75:
+                    self.stop_navigation()
+                    self.wander_logic()
+                    return
+
             if self.state == "GUIDING":
                 target = self.object_memory[self.target_label][self.target_index]
                 if math.hypot(curr_pos[0] - target[0], curr_pos[1] - target[1]) < 1.0:
-                    self.get_logger().info("PROXIMITY: Target near. Stopping to face the object.")
-                    if self.goal_handle: self.goal_handle.cancel_goal_async()
-                    self.is_navigating = False
+                    self.stop_navigation()
                     self.face_item_then_prompt(curr_pos, target)
                     return
 
-            if self.front_obstacle_detected and self.state == "WANDERING":
-                if self.goal_handle: self.goal_handle.cancel_goal_async()
-                self.is_navigating = False
+            if time.time() - self.nav_start_time < 2.0:
+                self.last_activity_time = time.time()
+                self.last_pos, self.last_rot = curr_pos, curr_rot_z
                 return
 
             if self.last_pos is not None:
-                if math.hypot(curr_pos[0]-self.last_pos[0], curr_pos[1]-self.last_pos[1]) > 0.05 or abs(curr_rot[0]-self.last_rot[0]) > 0.02:
+                move_dist = math.hypot(curr_pos[0]-self.last_pos[0], curr_pos[1]-self.last_pos[1])
+                rot_diff = abs(curr_rot_z - self.last_rot)
+                if move_dist > 0.02 or rot_diff > 0.01:
                     self.last_activity_time = time.time()
 
-            if time.time() - self.last_activity_time > 5.0:
+            if time.time() - self.last_activity_time > 2.5:
+                self.get_logger().warn(f"STALL Detected. Recovering...")
                 self.handle_stall(curr_pos)
-            self.last_pos, self.last_rot = curr_pos, curr_rot
-        except: pass
+
+            self.last_pos, self.last_rot = curr_pos, curr_rot_z
+        except Exception: pass
+
+    def stop_navigation(self):
+        if self.goal_handle:
+            self.goal_handle.cancel_goal_async()
+        self.is_navigating = False
+        self.last_pos = None
 
     def handle_stall(self, curr_pos):
-        if self.goal_handle: self.goal_handle.cancel_goal_async()
-        self.is_navigating = False
+        self.stop_navigation()
         self.last_activity_time = time.time()
-        if self.state == "GUIDING":
+
+        if self.state == "WANDERING":
+            # Attempt to pivot away and find a new direction
+            escape_angle = (self.last_angle + math.pi + random.uniform(-0.5, 0.5)) % (2*math.pi)
+            self.send_nav_goal(curr_pos[0] + 0.8*math.cos(escape_angle), 
+                               curr_pos[1] + 0.8*math.sin(escape_angle))
+        else:
             angle = random.uniform(0, 2*math.pi)
-            self.send_nav_goal(curr_pos[0] + 1.2*math.cos(angle), curr_pos[1] + 1.2*math.sin(angle))
-            threading.Timer(5.0, self.start_guidance).start()
-
-    def face_item_then_prompt(self, curr_pos, target_pos):
-        """Calculates the orientation to face the item and sends a rotation goal."""
-        angle_to_target = math.atan2(target_pos[1] - curr_pos[1], target_pos[0] - curr_pos[0])
-        
-        goal = NavigateToPose.Goal()
-        goal.pose.header.frame_id = 'map'
-        goal.pose.pose.position.x = float(curr_pos[0])
-        goal.pose.pose.position.y = float(curr_pos[1])
-        # Convert yaw to quaternion
-        goal.pose.pose.orientation.z = math.sin(angle_to_target / 2.0)
-        goal.pose.pose.orientation.w = math.cos(angle_to_target / 2.0)
-        
-        self.nav_client.wait_for_server()
-        self.get_logger().info(f"GUIDE: Rotating to face the {self.target_label}...")
-        self.nav_client.send_goal_async(goal).add_done_callback(
-            lambda _: threading.Timer(1.5, self.trigger_arrival_prompt).start()
-        )
-
-    def trigger_arrival_prompt(self):
-        total = len(self.object_memory[self.target_label])
-        print(f"\n[GUIDE] Arrived at {self.target_label} (Object {self.target_index+1} of {total})")
-        ans = input("Is this correct? (yes/no/nevermind): ").lower().strip()
-        if 'y' in ans or 'never' in ans: self.state = "WANDERING"
-        else: self.target_index += 1; self.start_guidance()
+            self.send_nav_goal(curr_pos[0] + 0.6*math.cos(angle), curr_pos[1] + 0.6*math.sin(angle))
+            threading.Timer(2.0, self.start_guidance).start()
 
     def wander_logic(self):
         if self.state != "WANDERING" or self.is_navigating: return
@@ -157,34 +166,77 @@ class KeyboardScout(Node):
             t = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
             curr = (t.transform.translation.x, t.transform.translation.y)
             if self.home_pose is None: self.home_pose = curr
-            for _ in range(15):
-                new_angle = (self.last_angle + random.uniform(math.pi/2, 3*math.pi/2)) % (2*math.pi)
-                dist = random.uniform(1.2, self.patrol_radius) 
+            
+            for _ in range(25):
+                new_angle = (self.last_angle + random.uniform(math.pi/3, 5*math.pi/3)) % (2*math.pi)
+                dist = random.uniform(2.5, self.patrol_radius) 
                 tx, ty = curr[0] + dist*math.cos(new_angle), curr[1] + dist*math.sin(new_angle)
+                
+                # Stay within radius
                 if math.hypot(tx - self.home_pose[0], ty - self.home_pose[1]) > self.patrol_radius:
                     ang = math.atan2(ty-self.home_pose[1], tx-self.home_pose[0])
-                    tx, ty = self.home_pose[0] + self.patrol_radius*math.cos(ang), self.home_pose[1] + self.patrol_radius*math.sin(ang)
+                    tx, ty = self.home_pose[0] + (self.patrol_radius * 0.9)*math.cos(ang), \
+                             self.home_pose[1] + (self.patrol_radius * 0.9)*math.sin(ang)
+                
                 if self.is_location_clear(tx, ty):
                     self.last_angle = new_angle
-                    self.send_nav_goal(tx, ty); return
-        except: pass
+                    self.send_nav_goal(tx, ty)
+                    return
+        except Exception: pass
 
     def is_location_clear(self, x, y):
+        """Enhanced clearance check to ensure the robot can fit at the target."""
         if self.latest_map is None: return True
         inf = self.latest_map.info
-        gx, gy = int((x - inf.origin.position.x) / inf.resolution), int((y - inf.origin.position.y) / inf.resolution)
-        if 0 <= gx < inf.width and 0 <= gy < inf.height:
-            return self.latest_map.data[gy * inf.width + gx] < 50
-        return False
+        # Check a 0.7m x 0.7m area to account for robot width
+        for dx in np.arange(-0.35, 0.36, 0.1):
+            for dy in np.arange(-0.35, 0.36, 0.1):
+                gx = int((x + dx - inf.origin.position.x) / inf.resolution)
+                gy = int((y + dy - inf.origin.position.y) / inf.resolution)
+                if 0 <= gx < inf.width and 0 <= gy < inf.height:
+                    if self.latest_map.data[gy * inf.width + gx] > 40: # Stricter threshold
+                        return False
+                else: return False
+        return True
 
-    def send_nav_goal(self, x, y):
+    def send_nav_goal(self, x, y, yaw=None):
+        self.current_wander_target = (x, y) 
+        self.nav_start_time = time.time()
+        self.last_activity_time = time.time()
+        
         goal = NavigateToPose.Goal()
         goal.pose.header.frame_id = 'map'
-        goal.pose.pose.position.x, goal.pose.pose.position.y, goal.pose.pose.orientation.w = float(x), float(y), 1.0
+        goal.pose.pose.position.x, goal.pose.pose.position.y = float(x), float(y)
+        
+        if yaw is not None:
+            goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        else:
+            goal.pose.pose.orientation.w = 1.0
+            
         self.is_navigating = True
-        self.last_activity_time = time.time()
         self.nav_client.wait_for_server()
         self.nav_client.send_goal_async(goal).add_done_callback(self.goal_resp_cb)
+
+    def face_item_then_prompt(self, curr_pos, target_pos):
+        angle_to_target = math.atan2(target_pos[1] - curr_pos[1], target_pos[0] - curr_pos[0])
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.pose.position.x, goal.pose.pose.position.y = float(curr_pos[0]), float(curr_pos[1])
+        goal.pose.pose.orientation.z = math.sin(angle_to_target / 2.0)
+        goal.pose.pose.orientation.w = math.cos(angle_to_target / 2.0)
+        
+        self.nav_client.wait_for_server()
+        self.nav_client.send_goal_async(goal).add_done_callback(
+            lambda _: threading.Timer(1.5, self.trigger_arrival_prompt).start()
+        )
+
+    def trigger_arrival_prompt(self):
+        total = len(self.object_memory[self.target_label])
+        print(f"\n[GUIDE] Found {self.target_label} ({self.target_index+1}/{total})")
+        ans = input("Is this correct? (y/n/nevermind): ").lower().strip()
+        if 'y' in ans or 'never' in ans: self.state = "WANDERING"
+        else: self.target_index += 1; self.start_guidance()
 
     def goal_resp_cb(self, future):
         self.goal_handle = future.result()
@@ -195,17 +247,18 @@ class KeyboardScout(Node):
         if future.result().status == 4:
             self.is_navigating = False
             if self.state == "GUIDING":
-                # Manual fallback if proximity didn't trigger
                 try:
                     t = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-                    self.face_item_then_prompt((t.transform.translation.x, t.transform.translation.y), self.object_memory[self.target_label][self.target_index])
-                except: self.trigger_arrival_prompt()
+                    self.face_item_then_prompt((t.transform.translation.x, t.transform.translation.y), 
+                                               self.object_memory[self.target_label][self.target_index])
+                except Exception: self.trigger_arrival_prompt()
 
     def rgb_cb(self, msg):
         try:
             img = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             depth = self.bridge.imgmsg_to_cv2(self.latest_depth_msg, 'passthrough') if self.latest_depth_msg else None
-        except: return
+        except Exception: return
+        
         if self.state == "WANDERING":
             results = self.model(img, stream=True, conf=0.45, verbose=False)
             for r in results:
@@ -230,11 +283,11 @@ class KeyboardScout(Node):
         try:
             res = self.tf_buffer.transform(p, 'map', timeout=rclpy.duration.Duration(seconds=0.05))
             return (res.point.x, res.point.y)
-        except: return None
+        except Exception: return None
 
     def save_to_map(self, label, loc):
         for inst in self.object_memory[label]:
-            if math.hypot(inst[0]-loc[0], inst[1]-loc[1]) < 0.6: return
+            if math.hypot(inst[0]-loc[0], inst[1]-loc[1]) < 0.8: return
         self.object_memory[label].append([loc[0], loc[1]])
         self.get_logger().info(f"!!! MEMORY: Found {label} !!!")
 
@@ -242,47 +295,27 @@ class KeyboardScout(Node):
         while rclpy.ok():
             if self.state == "WANDERING":
                 input("\n>>> [WANDERING] Press ENTER to search.")
-                if self.goal_handle: self.goal_handle.cancel_goal_async()
-                self.is_navigating = False; self.state = "MENU"; self.handle_menu()
+                self.stop_navigation()
+                self.state = "MENU"; self.handle_menu()
             time.sleep(0.1)
 
     def handle_menu(self):
         while True:
             seen = {k: len(v) for k, v in self.object_memory.items() if len(v) > 0}
-            print("\n--- VOICE SEARCH ---")
-            if seen:
-                for obj, count in seen.items():
-                    print(f"- {obj}: {count} instance(s)")
-            else:
-                print("Memory empty.")
-
-            query = self.voice.listen("Ask: 'Have you seen a bottle?' (or 'nevermind'): ").strip()
-            if is_cancel_query(query):
-                self.state = "WANDERING"
-                return
-
-            item = extract_item(query, self.target_list)
-            locations = self.object_memory.get(item, []) if item else []
-            self.voice.speak(format_answer(item, locations))
-
-            if item not in seen:
-                continue
-
-            if wants_guidance(query):
-                self.target_label, self.target_index = item, 0
-                self.start_guidance()
-                return
-
-            guide_ans = self.voice.listen(f"Should I guide you to the {item}? (yes/no): ").strip().lower()
-            if guide_ans.startswith('y'):
-                self.target_label, self.target_index = item, 0
-                self.start_guidance()
-                return
+            print(f"\n--- SEARCH MENU ---")
+            if not seen: print("Memory empty. Returning to patrol."); self.state = "WANDERING"; return
+            for obj, count in seen.items(): print(f"- {obj}: {count} instance(s)")
+            choice = input("\nTarget name (or 'back'): ").strip().lower()
+            if choice == 'back': self.state = "WANDERING"; return
+            if choice in seen: self.target_label, self.target_index = choice, 0; self.start_guidance(); return
 
     def start_guidance(self):
         locs = self.object_memory.get(self.target_label, [])
-        if self.target_index < len(locs): self.state = "GUIDING"; self.send_nav_goal(locs[self.target_index][0], locs[self.target_index][1])
-        else: print(f"\n[!] Ran out of {self.target_label} instances."); self.handle_menu()
+        if self.target_index < len(locs): 
+            self.state = "GUIDING"
+            self.send_nav_goal(locs[self.target_index][0], locs[self.target_index][1])
+        else: 
+            print(f"\n[!] End of list for {self.target_label}."); self.handle_menu()
 
     def map_cb(self, msg): self.latest_map = msg
     def info_cb(self, msg): self.camera_intrinsics = msg
@@ -291,13 +324,14 @@ class KeyboardScout(Node):
 def main():
     try:
         val = input("Enter patrol radius in meters: ")
-        user_radius = float(val)
-    except:
-        user_radius = 3.0
+        user_radius = float(val) if val.strip() else 3.0
+    except Exception: user_radius = 3.0
     rclpy.init()
     node = KeyboardScout(user_radius)
     try: rclpy.spin(node)
-    except: pass
-    finally: rclpy.shutdown()
+    except Exception: pass
+    finally:
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
 
 if __name__ == '__main__': main()
